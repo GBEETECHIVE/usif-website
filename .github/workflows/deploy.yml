@@ -1,0 +1,75 @@
+name: Deploy to VPS
+
+# Builds the production site on the runner (reliable network + RAM), then ships
+# the finished standalone build to the VPS and swaps it in. The prod box never
+# builds. Only the usif-web service is restarted; nothing else is touched.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build (standalone)
+        env:
+          BUILD_STANDALONE: "true"
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXT_PUBLIC_SITE_URL: "https://usinsurancefundings.com"
+        run: |
+          # next/font downloads the typeface at build time; retry to ride out
+          # any transient hiccup fetching it.
+          for attempt in 1 2 3; do
+            if npm run build; then break; fi
+            echo "build attempt $attempt failed; retrying in 5s"; sleep 5
+          done
+          test -f .next/standalone/server.js
+
+      - name: Assemble release bundle
+        run: |
+          set -euo pipefail
+          rm -rf bundle && mkdir -p bundle/.next
+          cp -r .next/standalone/. bundle/
+          cp -r .next/static bundle/.next/static
+          [ -d public ] && cp -r public bundle/public
+          tar -C bundle -czf bundle.tgz .
+          echo "bundle: $(du -h bundle.tgz | cut -f1)"
+
+      - name: Ship to VPS and release
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ] || [ -z "${VPS_HOST:-}" ] || [ -z "${VPS_USER:-}" ]; then
+            echo "::warning::Deploy secrets not set (VPS_SSH_KEY / VPS_HOST / VPS_USER)."
+            echo "The build succeeded. Add the secrets, then re-run to release. Skipping release."
+            exit 0
+          fi
+          PORT="${VPS_PORT:-22}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          SSHO="-i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -p $PORT"
+          scp $SSHO bundle.tgz "$VPS_USER@$VPS_HOST:/tmp/usif-bundle.tgz"
+          ssh $SSHO "$VPS_USER@$VPS_HOST" 'bash -s' < deploy/vps/release.sh
